@@ -1,2 +1,2 @@
-install-module Microsoft.Graph -Scope CurrentUser -Force
-get-installedmodule Microsoft.Graph
+Install-Module Microsoft.Graph -Scope CurrentUser -Force
+Get-InstalledModule Microsoft.Graph
