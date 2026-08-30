@@ -5,6 +5,7 @@
     This script reads user data from a CSV file, creates users in Microsoft Entra ID,
     and automatically creates security groups for each department, adding users to their respective groups.
     UserPrincipalName is automatically generated from GivenName + Surname + Domain.
+    EXISTING USERS ARE SKIPPED - they are not created again, but are added to groups.
 .PARAMETER CsvPath
     Path to the CSV file containing user data.
 .PARAMETER Domain
@@ -23,10 +24,14 @@
     Default description for groups.
 .PARAMETER CreateGroupsOnly
     If true, only creates groups without creating users.
+.PARAMETER SkipExistingUsers
+    If true, skips existing users (does not create them). Default is $true.
 .EXAMPLE
     .\Create-BulkUsers-WithGroups.ps1 -CsvPath "users.csv"
 .EXAMPLE
-    .\Create-BulkUsers-WithGroups.ps1 -CsvPath "users.csv" -GroupPrefix "M365_" -DryRun
+    .\Create-BulkUsers-WithGroups.ps1 -CsvPath "users.csv" -SkipExistingUsers $false
+.EXAMPLE
+    .\Create-BulkUsers-WithGroups.ps1 -CsvPath "users.csv" -DryRun
 #>
 
 param(
@@ -57,6 +62,10 @@ param(
     
     [Parameter(Mandatory = $false)]
     [switch]$CreateGroupsOnly,
+
+    # --- Skip Existing Users ---
+    [Parameter(Mandatory = $false)]
+    [bool]$SkipExistingUsers = $true,
 
     # --- Default User Parameters ---
     [Parameter(Mandatory = $false)]
@@ -138,8 +147,8 @@ function Test-Domain {
     return $true
 }
 
-# --- Helper Function: Assign License to User ---
-function Set-UserLicense {
+# --- Helper Function: Add License to User ---
+function Add-LicenseToUser {
     param(
         [string]$UserId,
         [string]$LicenseSku,
@@ -261,6 +270,45 @@ function Add-UserToGroup {
     }
 }
 
+# --- Helper Function: Check if User Exists ---
+function Get-ExistingUser {
+    param([string]$UserPrincipalName)
+    
+    # Try multiple methods to find the user
+    
+    # Method 1: Direct lookup by UserPrincipalName
+    try {
+        $user = Get-MgUser -UserId $UserPrincipalName -ErrorAction SilentlyContinue
+        if ($user) { return $user }
+    } catch { }
+    
+    # Method 2: Filter by userPrincipalName
+    try {
+        $user = Get-MgUser -Filter "userPrincipalName eq '$UserPrincipalName'" -ErrorAction SilentlyContinue
+        if ($user) { return $user }
+    } catch { }
+    
+    # Method 3: Filter by mail (email attribute)
+    try {
+        $user = Get-MgUser -Filter "mail eq '$UserPrincipalName'" -ErrorAction SilentlyContinue
+        if ($user) { return $user }
+    } catch { }
+    
+    # Method 4: Check by proxyAddresses (smtp:user@domain.com)
+    try {
+        $user = Get-MgUser -Filter "proxyAddresses/any(c:c eq 'smtp:$UserPrincipalName')" -ErrorAction SilentlyContinue
+        if ($user) { return $user }
+    } catch { }
+    
+    # Method 5: Check by otherMail (alternative email)
+    try {
+        $user = Get-MgUser -Filter "otherMails/any(c:c eq '$UserPrincipalName')" -ErrorAction SilentlyContinue
+        if ($user) { return $user }
+    } catch { }
+    
+    return $null
+}
+
 # --- Connect to Microsoft Graph ---
 Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Cyan
 Connect-MgGraph -Scopes "User.ReadWrite.All", "Directory.ReadWrite.All", "Organization.Read.All", "Group.ReadWrite.All" -ErrorAction Stop
@@ -280,6 +328,7 @@ if (-not (Test-Domain -Domain $Domain)) {
 }
 
 Write-Host "Using domain: $Domain" -ForegroundColor Cyan
+Write-Host "Skip Existing Users: $SkipExistingUsers" -ForegroundColor Cyan
 
 # --- Read CSV Data ---
 Write-Host "Reading CSV file: $CsvPath" -ForegroundColor Cyan
@@ -387,10 +436,12 @@ if ($CreateGroupsOnly) {
 
 # --- Statistics ---
 $totalUsers = $users.Count
-$successCount = 0
+$createdCount = 0
+$skippedCount = 0
 $failedCount = 0
 $failedUsers = @()
 $createdUsers = @()
+$skippedUsers = @()
 $groupAddSuccess = 0
 $groupAddFailed = 0
 
@@ -458,19 +509,47 @@ foreach ($user in $users) {
     # --- Generate UserPrincipalName ---
     $userPrincipalName = New-UserPrincipalName -GivenName $finalGivenName -Surname $finalSurname -Domain $Domain
     
-    # --- Check for duplicate UPN ---
-    $counterSuffix = 0
-    $originalUPN = $userPrincipalName
-    $upnExists = $true
+    # --- Check if user already exists (using the comprehensive function) ---
+    $existingUser = Get-ExistingUser -UserPrincipalName $userPrincipalName
     
-    while ($upnExists) {
-        $existingUser = Get-MgUser -UserId $userPrincipalName -ErrorAction SilentlyContinue
-        if ($existingUser) {
-            $counterSuffix++
-            $userPrincipalName = $originalUPN -replace '@', "$counterSuffix@"
-            Write-Host "  ℹ️ UPN conflict. Trying: $userPrincipalName" -ForegroundColor Yellow
+    if ($existingUser) {
+        if ($SkipExistingUsers) {
+            Write-Host "  ⏭️ User already exists, skipping creation: $userPrincipalName" -ForegroundColor Yellow
+            $skippedCount++
+            
+            # Still add existing user to group
+            if ($department -and $departmentGroups.ContainsKey($department)) {
+                $groupId = $departmentGroups[$department]
+                if (Add-UserToGroup -UserId $existingUser.Id -GroupId $groupId) {
+                    $groupAddSuccess++
+                } else {
+                    $groupAddFailed++
+                }
+            }
+            
+            $skippedUsers += [PSCustomObject]@{
+                UserPrincipalName = $userPrincipalName
+                DisplayName = $displayName
+                Department = $department
+                Status = "Skipped (Already Exists)"
+                Group = if ($department -and $departmentGroups.ContainsKey($department)) { "$GroupPrefix$department" } else { "None" }
+            }
+            
+            continue
         } else {
-            $upnExists = $false
+            # --- SkipExistingUsers is FALSE: find a free UPN and create a distinct account ---
+            Write-Host "  ℹ️ User already exists but -SkipExistingUsers is FALSE. Creating a new account with a different UPN." -ForegroundColor Cyan
+            $counterSuffix = 0
+            $originalUPN = $userPrincipalName
+            $upnExists = $true
+            
+            while ($upnExists) {
+                $counterSuffix++
+                $userPrincipalName = $originalUPN -replace '@', "$counterSuffix@"
+                Write-Host "  ℹ️ UPN conflict. Trying: $userPrincipalName" -ForegroundColor Yellow
+                $existingUser = Get-ExistingUser -UserPrincipalName $userPrincipalName
+                $upnExists = [bool]$existingUser
+            }
         }
     }
     
@@ -507,30 +586,13 @@ foreach ($user in $users) {
     if ($city) { $userParams.City = $city }
     if ($mobilePhone) { $userParams.MobilePhone = $mobilePhone }
     
-    # --- Check if user already exists ---
-    $existingUser = Get-MgUser -UserId $userPrincipalName -ErrorAction SilentlyContinue
-    if ($existingUser) {
-        Write-Host "  ℹ️ User already exists: $userPrincipalName" -ForegroundColor Cyan
-        $successCount++
-        # Try to add existing user to group
-        if ($department -and $departmentGroups.ContainsKey($department)) {
-            $groupId = $departmentGroups[$department]
-            if (Add-UserToGroup -UserId $existingUser.Id -GroupId $groupId) {
-                $groupAddSuccess++
-            } else {
-                $groupAddFailed++
-            }
-        }
-        continue
-    }
-    
     # --- Create the user ---
     if ($DryRun) {
         Write-Host "  🧪 [DRY RUN] Would create: $userPrincipalName" -ForegroundColor Yellow
         Write-Host "    Department: $department" -ForegroundColor Gray
         Write-Host "    Group: $(if ($department -and $departmentGroups.ContainsKey($department)) { "$GroupPrefix$department" } else { 'None' })" -ForegroundColor Gray
         
-        $successCount++
+        $createdCount++
         $createdUsers += [PSCustomObject]@{
             UserPrincipalName = $userPrincipalName
             DisplayName = $displayName
@@ -551,7 +613,7 @@ foreach ($user in $users) {
             $newUser = New-MgUser @userParams -ErrorAction Stop
             
             Write-Host "  ✅ User created successfully!" -ForegroundColor Green
-            $successCount++
+            $createdCount++
             
             # --- Assign License if specified ---
             if ($licenseSku) {
@@ -602,7 +664,8 @@ foreach ($user in $users) {
 Write-Host ("=" * 60) -ForegroundColor Gray
 Write-Host "📊 SUMMARY" -ForegroundColor Magenta
 Write-Host "  Total Users Processed: $totalUsers" -ForegroundColor White
-Write-Host "  ✅ Users Created/Successful: $successCount" -ForegroundColor Green
+Write-Host "  ✅ Users Created: $createdCount" -ForegroundColor Green
+Write-Host "  ⏭️ Users Skipped (Already Exists): $skippedCount" -ForegroundColor Yellow
 Write-Host "  ❌ Users Failed: $failedCount" -ForegroundColor Red
 Write-Host ""
 Write-Host "📋 Group Summary:" -ForegroundColor Cyan
@@ -613,6 +676,11 @@ Write-Host "  ❌ Users Failed to Add to Groups: $groupAddFailed" -ForegroundCol
 if ($createdUsers) {
     Write-Host "`n📋 Created Users:" -ForegroundColor Cyan
     $createdUsers | Format-Table UserPrincipalName, DisplayName, Department, Status, Group, Password -AutoSize
+}
+
+if ($skippedUsers) {
+    Write-Host "`n⏭️ Skipped Users (Already Exists):" -ForegroundColor Yellow
+    $skippedUsers | Format-Table UserPrincipalName, DisplayName, Department, Status, Group -AutoSize
 }
 
 if ($failedUsers) {
@@ -628,11 +696,17 @@ foreach ($dept in $departmentGroups.Keys) {
 # --- Export results to CSV ---
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $resultPath = "UserCreation_Results_$timestamp.csv"
+$skippedPath = "SkippedUsers_$timestamp.csv"
 $groupResultPath = "DepartmentGroups_$timestamp.csv"
 
 if ($createdUsers) {
     $createdUsers | Export-Csv -Path $resultPath -NoTypeInformation
     Write-Host "`n📁 User results exported to: $resultPath" -ForegroundColor Cyan
+}
+
+if ($skippedUsers) {
+    $skippedUsers | Export-Csv -Path $skippedPath -NoTypeInformation
+    Write-Host "📁 Skipped users exported to: $skippedPath" -ForegroundColor Yellow
 }
 
 if ($departmentGroups) {
