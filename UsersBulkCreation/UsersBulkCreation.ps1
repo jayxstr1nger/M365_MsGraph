@@ -309,9 +309,20 @@ function Get-ExistingUser {
     return $null
 }
 
-# --- Connect to Microsoft Graph ---
+<# --- Connect to Microsoft Graph ---
 Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Cyan
 Connect-MgGraph -Scopes "User.ReadWrite.All", "Directory.ReadWrite.All", "Organization.Read.All", "Group.ReadWrite.All" -ErrorAction Stop
+
+# Create a secure credential file (run once)
+$credential = Get-Credential
+$credential | Export-Clixml -Path "C:\Terraform\graph_cred.xml"
+
+# Then use it in your script
+$credential = Import-Clixml -Path "C:\Terraform\graph_cred.xml"
+Connect-MgGraph -ClientId "3cbdabae-f14c-4e3e-8752-d4150d05f7aa" `
+    -TenantId "dfa3a4aa-d956-45fd-9a83-e0ddfd4780ba" `
+    -ClientSecret $credential.GetNetworkCredential().Password
+#>    
 
 # --- Validate CSV File ---
 if (-not (Test-Path $CsvPath)) {
