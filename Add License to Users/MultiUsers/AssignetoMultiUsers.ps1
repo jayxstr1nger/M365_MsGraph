@@ -1,0 +1,1 @@
+.\Assign-M365License-Multi.ps1 -CsvPath ".\userslicense.csv"
