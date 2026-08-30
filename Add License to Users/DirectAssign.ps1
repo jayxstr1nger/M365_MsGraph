@@ -1,0 +1,1 @@
+.\Assign-M365License-Multi.ps1 -UserPrincipalNames @("john@contoso.com", "jane@contoso.com", "bob@contoso.com")

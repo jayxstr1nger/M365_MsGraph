@@ -1,0 +1,1 @@
+.\Assign-M365License.ps1 -UserPrincipalName "user@contoso.com"
