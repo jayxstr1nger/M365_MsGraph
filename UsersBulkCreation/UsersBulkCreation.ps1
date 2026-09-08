@@ -39,7 +39,7 @@ param(
     [string]$CsvPath,
     
     [Parameter(Mandatory = $false)]
-    [string]$Domain = "IntBussMgt.onmicrosoft.com",
+    [string]$Domain = "kungfuboi2012hotmail.onmicrosoft.com",
     
     [Parameter(Mandatory = $false)]
     [SecureString]$DefaultPassword,
@@ -58,7 +58,7 @@ param(
     [string]$GroupPrefix = "Department_",
     
     [Parameter(Mandatory = $false)]
-    [string]$GroupDescription = "Auto-created department group",
+    [string]$GroupDescription = "Department group",
     
     [Parameter(Mandatory = $false)]
     [switch]$CreateGroupsOnly,
